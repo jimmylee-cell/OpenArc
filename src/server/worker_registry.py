@@ -1,4 +1,5 @@
 import logging
+import os
 import asyncio
 import uuid
 import base64
@@ -25,6 +26,11 @@ from src.server.model_registry import ModelRecord, ModelRegistry
 from src.server.models.registration import ModelType
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Bound per-model request queues so a burst of requests cannot grow memory
+# unbounded while waiting for the model worker.
+MAX_QUEUE_SIZE = int(os.getenv("OPENARC_WORKER_QUEUE_SIZE", "32"))
 
 @dataclass
 class WorkerPacket:
@@ -73,11 +79,11 @@ class WorkerPacket:
 class InferWorker:
     """
     Handles generation for individual packets.
-
+    
     Responsibilities:
     - Execute generation requests using pipelines
 
-
+    
     Methods:
     - infer_llm: Process text-to-text generation requests
     - infer_vlm: Process image-to-text generation requests
@@ -86,7 +92,7 @@ class InferWorker:
     - infer_emb: Process embedding requests
     - infer_rerank: Process reranking requests
     """
-
+    
     @staticmethod
     async def infer_llm(packet: WorkerPacket, llm_instance: OVGenAI_LLM) -> WorkerPacket:
         """Generate text for a single packet using the OVGenAI_LLM pipeline"""
@@ -120,7 +126,7 @@ class InferWorker:
             # Signal error to stream if streaming
             if packet.gen_config.stream and packet.stream_queue is not None:
                 await packet.stream_queue.put(None)
-
+                
         return packet
 
     @staticmethod
@@ -156,7 +162,7 @@ class InferWorker:
             # Signal error to stream if streaming
             if packet.gen_config.stream and packet.stream_queue is not None:
                 await packet.stream_queue.put(None)
-
+                
         return packet
 
     @staticmethod
@@ -184,7 +190,7 @@ class InferWorker:
             # Store error in packet response
             packet.response = f"Error: {str(e)}"
             packet.metrics = None
-
+            
         return packet
 
     @staticmethod
@@ -245,7 +251,7 @@ class InferWorker:
             packet.metrics = None
 
         return packet
-
+    
     @staticmethod
     async def infer_qwen3_tts(packet: WorkerPacket, tts_model: OVQwen3TTS) -> WorkerPacket:
         """Generate speech audio for a single packet using the OVQwen3TTS engine."""
@@ -309,7 +315,7 @@ class InferWorker:
 
             packet.response = final_data
             packet.metrics = metrics
-
+            
         except Exception as e:
             # Log the full exception with traceback
             logger.error("EMB inference failed!", exc_info=True)
@@ -319,7 +325,7 @@ class InferWorker:
             # Signal error to stream if streaming
             if packet.gen_config.stream and packet.stream_queue is not None:
                 await packet.stream_queue.put(None)
-
+                
         return packet
 
     @staticmethod
@@ -337,7 +343,7 @@ class InferWorker:
 
             packet.response = final_data
             packet.metrics = metrics
-
+            
         except Exception as e:
             # Log the full exception with traceback
             logger.error("Reranking failed!", exc_info=True)
@@ -347,14 +353,37 @@ class InferWorker:
             # Signal error to stream if streaming
             if packet.gen_config.stream and packet.stream_queue is not None:
                 await packet.stream_queue.put(None)
-
+                
         return packet
-
+    
 class QueueWorker:
     """
     Manages inference worker loops for consuming and processing packets from model queues.
 
     """
+
+    @staticmethod
+    async def _drain_pending_packets(model_queue: asyncio.Queue, model_name: str) -> None:
+        """Drain any packets left in the queue after a worker failure so callers
+        are not left waiting forever and packet memory is released promptly.
+        """
+        while not model_queue.empty():
+            try:
+                leftover = model_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if leftover is None:
+                model_queue.task_done()
+                continue
+            leftover.response = "Error: model worker stopped unexpectedly"
+            if leftover.result_future is not None and not leftover.result_future.done():
+                leftover.result_future.set_result(leftover)
+            if leftover.stream_queue is not None:
+                try:
+                    await leftover.stream_queue.put(None)
+                except Exception:
+                    pass
+            model_queue.task_done()
 
     @staticmethod
     async def queue_worker_llm(model_name: str, model_queue: asyncio.Queue, llm_model: OVGenAI_LLM, registry: ModelRegistry):
@@ -372,6 +401,7 @@ class QueueWorker:
             if completed_packet.response and completed_packet.response.startswith("Error:"):
                 logger.error(f"[LLM Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
 
             if completed_packet.metrics:
@@ -398,6 +428,7 @@ class QueueWorker:
             if completed_packet.response and completed_packet.response.startswith("Error:"):
                 logger.error(f"[VLM Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
 
             if completed_packet.metrics:
@@ -424,6 +455,7 @@ class QueueWorker:
             if completed_packet.response and completed_packet.response.startswith("Error:"):
                 logger.error(f"[Whisper Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
 
             if completed_packet.metrics:
@@ -449,6 +481,7 @@ class QueueWorker:
             if completed_packet.response and completed_packet.response.startswith("Error:"):
                 logger.error(f"[Qwen3ASR Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
 
             if completed_packet.metrics:
@@ -475,10 +508,11 @@ class QueueWorker:
             if completed_packet.response and completed_packet.response.startswith("Error:"):
                 logger.error(f"[Kokoro Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
 
             # Log the text that was converted to speech
-
+            
             if completed_packet.metrics:
                 logger.info(f"[Kokoro Worker: {model_name}] Metrics: {completed_packet.metrics}")
 
@@ -504,6 +538,7 @@ class QueueWorker:
                 if completed_packet.response and completed_packet.response.startswith("Error:"):
                     logger.error(f"[Qwen3TTS Worker: {model_name}] Inference failed, triggering model unload...")
                     asyncio.create_task(registry.register_unload(model_name))
+                    await QueueWorker._drain_pending_packets(model_queue, model_name)
                     break
 
             if completed_packet.metrics:
@@ -529,6 +564,7 @@ class QueueWorker:
             if not completed_packet.response:
                 logger.error(f"[EMB Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
             if completed_packet.metrics:
                 logger.info(f"[EMB Worker: {model_name}] Metrics: {completed_packet.metrics}")
@@ -551,6 +587,7 @@ class QueueWorker:
             if not completed_packet.response:
                 logger.error(f"[Reranker Worker: {model_name}] Inference failed, triggering model unload...")
                 asyncio.create_task(registry.register_unload(model_name))
+                await QueueWorker._drain_pending_packets(model_queue, model_name)
                 break
             if completed_packet.metrics:
                 logger.info(f"[Reranker Worker: {model_name}] Metrics: {completed_packet.metrics}")
@@ -561,12 +598,12 @@ class QueueWorker:
 class WorkerRegistry:
     """
     Central orchestrator for managing per-model inference workers and request routing.
-
+    
     WorkerRegistry serves as the main coordination layer that bridges the ModelRegistry
     with the actual inference execution. It automatically spawns and manages dedicated
     worker tasks for each loaded model, routing generation requests to the appropriate
     model-specific queues.
-
+    
 
     """
 
@@ -599,7 +636,7 @@ class WorkerRegistry:
         self._model_tasks_rerank: Dict[str, asyncio.Task] = {}
 
         self._lock = asyncio.Lock()
-
+        
         # Track active requests for cancellation: request_id -> (model_name, packet)
         self._active_requests: Dict[str, tuple[str, WorkerPacket]] = {}
 
@@ -625,28 +662,28 @@ class WorkerRegistry:
         async with self._lock:
             if mt == ModelType.LLM and isinstance(instance, OVGenAI_LLM):
                 if record.model_name not in self._model_queues_llm:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_llm[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_llm(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_llm[record.model_name] = task
 
             elif mt == ModelType.VLM and isinstance(instance, OVGenAI_VLM):
                 if record.model_name not in self._model_queues_vlm:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_vlm[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_vlm(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_vlm[record.model_name] = task
 
             elif mt == ModelType.WHISPER and isinstance(instance, OVGenAI_Whisper):
                 if record.model_name not in self._model_queues_whisper:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_whisper[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_whisper(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_whisper[record.model_name] = task
 
             elif mt == ModelType.QWEN3_ASR and isinstance(instance, OVQwen3ASR):
                 if record.model_name not in self._model_queues_qwen3_asr:
-                    q = asyncio.Queue()
+                    q = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_qwen3_asr[record.model_name] = q
                     task = asyncio.create_task(
                         QueueWorker.queue_worker_qwen3_asr(record.model_name, q, instance, self._model_registry)
@@ -655,7 +692,7 @@ class WorkerRegistry:
 
             elif mt == ModelType.KOKORO and isinstance(instance, OV_Kokoro):
                 if record.model_name not in self._model_queues_kokoro:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_kokoro[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_kokoro(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_kokoro[record.model_name] = task
@@ -666,7 +703,7 @@ class WorkerRegistry:
                 ModelType.QWEN3_TTS_VOICE_CLONE,
             ) and isinstance(instance, OVQwen3TTS):
                 if record.model_name not in self._model_queues_qwen3_tts:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_qwen3_tts[record.model_name] = q
                     task = asyncio.create_task(
                         QueueWorker.queue_worker_qwen3_tts(record.model_name, q, instance, self._model_registry)
@@ -675,14 +712,14 @@ class WorkerRegistry:
 
             elif mt == ModelType.EMB and isinstance(instance, Optimum_EMB):
                 if record.model_name not in self._model_queues_emb:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_emb[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_emb(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_emb[record.model_name] = task
-
+            
             elif mt == ModelType.RERANK and isinstance(instance, Optimum_RR):
                 if record.model_name not in self._model_queues_rerank:
-                    q: asyncio.Queue = asyncio.Queue()
+                    q: asyncio.Queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
                     self._model_queues_rerank[record.model_name] = q
                     task = asyncio.create_task(QueueWorker.queue_worker_rr(record.model_name, q, instance, self._model_registry))
                     self._model_tasks_rerank[record.model_name] = task
@@ -746,7 +783,7 @@ class WorkerRegistry:
                 await q.put(None)
             if t is not None and not t.done():
                 t.cancel()
-
+                
             # Try rerank dicts
             q = self._model_queues_rerank.pop(record.model_name, None)
             t = self._model_tasks_rerank.pop(record.model_name, None)
@@ -799,7 +836,7 @@ class WorkerRegistry:
         if q is not None:
             return q
         raise ValueError(f"Rerank model '{model_name}' is not loaded or no worker is available")
-
+    
     async def generate(self, model_name: str, gen_config: OVGenAI_GenConfig) -> Dict[str, Any]:
         """Generate text without streaming."""
         request_id = uuid.uuid4().hex
@@ -819,7 +856,7 @@ class WorkerRegistry:
         """Generate text with streaming."""
         request_id = uuid.uuid4().hex
         gen_config.request_id = request_id  # Set request_id for cancellation tracking
-
+        
         stream_queue: asyncio.Queue = asyncio.Queue()
         result_future: asyncio.Future = asyncio.get_running_loop().create_future()
         packet = WorkerPacket(
@@ -829,11 +866,11 @@ class WorkerRegistry:
             stream_queue=stream_queue,
             result_future=result_future,
         )
-
+        
         # Register active request
         async with self._lock:
             self._active_requests[request_id] = (model_name, packet)
-
+        
         try:
             q = self._get_model_queue(model_name)
             await q.put(packet)
@@ -850,17 +887,17 @@ class WorkerRegistry:
     async def infer_cancel(self, request_id: str) -> bool:
         """
         Cancel an ongoing inference request by request_id.
-
+        
         Args:
             request_id: The request ID to cancel
-
+            
         Returns:
             True if cancellation was triggered, False if request not found
         """
         async with self._lock:
             if request_id in self._active_requests:
                 model_name, _ = self._active_requests[request_id]
-
+                
                 # Look up model instance from ModelRegistry
                 async with self._model_registry._lock:
                     for record in self._model_registry._models.values():
@@ -967,7 +1004,7 @@ class WorkerRegistry:
         await q.put(packet)
         completed = await result_future
         return {"audio_base64": completed.response or "", "metrics": completed.metrics or {}}
-
+    
     async def embed(self, model_name: str, tok_config: PreTrainedTokenizerConfig) -> Dict[str, Any]:
         """Create embeddings."""
         request_id = uuid.uuid4().hex
@@ -982,7 +1019,7 @@ class WorkerRegistry:
         await q.put(packet)
         completed = await result_future
         return {"data": completed.response, "metrics": completed.metrics or {}}
-
+    
     async def rerank(self, model_name: str, rr_config: RerankerConfig) -> Dict[str, Any]:
         """Rerank documents."""
         request_id = uuid.uuid4().hex
